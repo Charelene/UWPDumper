@@ -12,6 +12,7 @@ on:
       - '**.md'
     branches:
       - master
+  workflow_dispatch:
   release:
 
 jobs:

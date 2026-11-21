@@ -1,9 +1,13 @@
-# UWPDumper [![Build](https://github.com/Wunkolo/UWPDumper/actions/workflows/ci.yml/badge.svg)](https://github.com/Wunkolo/UWPDumper/actions/workflows/ci.yml) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/Wunkolo/UWPDumper/master/LICENSE)
-## [Download latest binary here!](https://github.com/Wunkolo/UWPDumper/releases/)
+# UWPDumper [![Build](https://github.com/Charelene/UWPDumper/actions/workflows/ci.yml/badge.svg)](https://github.com/Charelene/UWPDumper/actions/workflows/ci.yml) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/Wunkolo/UWPDumper/master/LICENSE)
+## [Download latest binary here!](https://github.com/Charelene/UWPDumper/releases/)
 
 ---
 
 DLL and Injector for dumping UWP applications at run-time to bypass encrypted file system protection.
+
+This fork of [Wunkolo/UWPDumper](https://github.com/Wunkolo/UWPDumper) can also
+dump installed optional packages (DLC) with `-o`. See
+[Dumping DLC](#dumping-dlc-optional-packages) below.
 
 ![Demo1](media/demo1.gif)
 

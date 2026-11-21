@@ -2,8 +2,9 @@
 
 #include <array>
 #include <atomic>
-#include <thread>
 #include <cstdarg>
+#include <cwchar>
+#include <Windows.h>
 
 /// API
 namespace IPC
@@ -14,6 +15,10 @@ MessageEntry::MessageEntry(const wchar_t* String)
 	wcscpy_s(this->String, MessageEntry::StringSize, String);
 }
 
+// The queue keeps Head and Tail as free-running counters and takes the index
+// modulo MaxSize. Head == Tail means empty, and Tail - Head is the number of
+// queued entries. Enqueue drops the oldest entry when the queue is full so a
+// fast dumper can never make the counters wrap into a bogus "full" state.
 template< typename QueueType, std::size_t PoolSize >
 class AtomicQueue
 {
@@ -21,46 +26,40 @@ public:
 	using Type = QueueType;
 	static constexpr std::size_t MaxSize = PoolSize;
 
-	AtomicQueue()
-		:
-		Head(0),
-		Tail(0)
-	{ }
-
-	~AtomicQueue()
-	{ }
+	AtomicQueue() = default;
+	~AtomicQueue() = default;
 
 	void Enqueue(const Type& Entry)
 	{
-		while( Mutex.test_and_set(std::memory_order_acquire) )
+		Lock();
+		Entries[Tail % MaxSize] = Entry;
+		++Tail;
+		if( Tail - Head > MaxSize )
 		{
-			std::this_thread::yield();
+			Head = Tail - MaxSize;
 		}
-		Entries[Tail] = Entry;
-		Tail = (Tail + 1) % MaxSize;
-		Mutex.clear(std::memory_order_release);
+		Unlock();
 	}
 
-	Type Dequeue()
+	bool Dequeue(Type& Output)
 	{
-		while( Mutex.test_and_set(std::memory_order_acquire) )
+		Lock();
+		if( Head == Tail )
 		{
-			std::this_thread::yield();
+			Unlock();
+			return false;
 		}
-		Type Temp = Entries[Head];
-		Head = (Head + 1) % MaxSize;
-		Mutex.clear(std::memory_order_release);
-		return Temp;
+		Output = Entries[Head % MaxSize];
+		++Head;
+		Unlock();
+		return true;
 	}
 
 	std::size_t Size()
 	{
-		while( Mutex.test_and_set(std::memory_order_acquire) )
-		{
-			std::this_thread::yield();
-		}
-		Mutex.clear(std::memory_order_release);
+		Lock();
 		const std::size_t Result = Tail - Head;
+		Unlock();
 		return Result;
 	}
 
@@ -70,29 +69,56 @@ public:
 	}
 
 private:
-	std::array<Type, MaxSize> Entries = {
-		Type()
-	};
+	void Lock()
+	{
+		while( Mutex.test_and_set(std::memory_order_acquire) )
+		{
+			SwitchToThread();
+		}
+	}
+
+	void Unlock()
+	{
+		Mutex.clear(std::memory_order_release);
+	}
+
+	std::array<Type, MaxSize> Entries = {};
 	std::size_t Head = 0;
 	std::size_t Tail = 0;
 	std::atomic_flag Mutex = ATOMIC_FLAG_INIT;
 };
 
 ////// Shared IPC Region //////////////////////////////////////////////////////
+// The injector links against UWPDumper.dll, so the loader maps the DLL into
+// both processes and these variables live in the same shared section.
+#ifdef _MSC_VER
 #pragma data_seg("SHARED")
-AtomicQueue<MessageEntry, 1024> MessagePool = {};
-std::atomic<std::size_t> CurMessageCount = 0;
+#define SHARED_DATA
+#else
+#define SHARED_DATA __attribute__((section("SHARED"), shared))
+#endif
+
+SHARED_DATA AtomicQueue<MessageEntry, 4096> MessagePool = {};
+SHARED_DATA std::atomic<std::size_t> CurMessageCount = 0;
 
 // The process we are sending our data to
-std::atomic<std::uint32_t> ClientProcess(0);
+SHARED_DATA std::atomic<std::uint32_t> ClientProcess(0);
 
 // The target UWP process we wish to dump
-std::atomic<std::uint32_t> TargetProcess(0);
+SHARED_DATA std::atomic<std::uint32_t> TargetProcess(0);
 
-std::atomic<std::int32_t> TargetThread(InvalidThread);
+// Also dump the optional packages (DLC) of the target package
+SHARED_DATA std::atomic<bool> DumpOptional = false;
 
+// Dump folder, filled in by the injector before it injects the DLL
+SHARED_DATA wchar_t DumpPathBuffer[DumpPathSize] = { 0 };
+
+SHARED_DATA std::atomic<std::int32_t> TargetThread(InvalidThread);
+
+#ifdef _MSC_VER
 #pragma data_seg()
 #pragma comment(linker, "/section:SHARED,RWS")
+#endif
 ///////////////////////////////////////////////////////////////////////////////
 
 void SetClientProcess(std::uint32_t ProcessID)
@@ -113,6 +139,26 @@ void SetTargetProcess(std::uint32_t ProcessID)
 std::uint32_t GetTargetProcess()
 {
 	return TargetProcess;
+}
+
+void SetDumpOptionalPackages(bool Enabled)
+{
+	DumpOptional = Enabled;
+}
+
+bool GetDumpOptionalPackages()
+{
+	return DumpOptional;
+}
+
+void SetDumpPath(const wchar_t* Path)
+{
+	wcsncpy_s(DumpPathBuffer, DumpPathSize, Path != nullptr ? Path : L"", _TRUNCATE);
+}
+
+const wchar_t* GetDumpPath()
+{
+	return DumpPathBuffer;
 }
 
 IPC_API void SetTargetThread(std::int32_t ThreadID)
@@ -147,9 +193,9 @@ void PushMessage(const wchar_t* Format, ...)
 
 bool PopMessage(std::wstring& Output)
 {
-	if( MessageCount() )
+	MessageEntry Entry;
+	if( MessagePool.Dequeue(Entry) )
 	{
-		const MessageEntry Entry = MessagePool.Dequeue();
 		Output.assign(Entry.String, wcslen(Entry.String));
 		return true;
 	}

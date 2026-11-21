@@ -1,16 +1,18 @@
 #include <iostream>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <chrono>
 #include <filesystem>
 
 #include <windows.h>
-#include <psapi.h> //GetModuleFileNameEx
+#include <shellapi.h>
 #include <TlHelp32.h>
 
 // Setting DLL access controls
@@ -19,7 +21,6 @@
 #include <Sddl.h>
 
 // UWP
-#include <atlbase.h>
 #include <appmodel.h>
 
 // IPC
@@ -148,7 +149,12 @@ const char* HelpText =
 "    -l \n"
 "To Dump To A Custom Folder:\n"
 "    -d {folder} \n"
-"EG: -d D:\\uwp\\dumps\\calculator";
+"EG: -d D:\\uwp\\dumps\\calculator\n"
+"Dump installed optional packages (DLC) as well:\n"
+"    -o\n"
+"EG: -p 1234 -o\n"
+"The main package is dumped into the dump folder as before, every optional\n"
+"package gets its own subfolder named after its package identity.";
 
 int main(int argc, char** argv, char** envp)
 {
@@ -156,20 +162,22 @@ int main(int argc, char** argv, char** envp)
 	std::filesystem::path TargetPath;
 	bool Logging = false;
 	bool Continuous = false;
+	bool DumpOptional = false;
 	if( argc > 1 )
 	{
 		for( std::size_t i = 1; i < argc; ++i )
 		{
-			if( std::string_view(argv[i]) == "-h" )
+			const std::string_view Argument(argv[i]);
+			if( Argument == "-h" || Argument == "--help" )
 			{
 				std::cout << HelpText << std::endl;
 				return 0;
 			}
-			else if( std::string_view(argv[i]) == "-p" )
+			else if( Argument == "-p" || Argument == "--pid" )
 			{
-				if( i != argc )
+				if( i + 1 < argc )
 				{
-					ProcessID = (std::uint32_t)atoi(argv[i + 1]);
+					ProcessID = static_cast<std::uint32_t>(atoi(argv[++i]));
 				}
 				else
 				{
@@ -177,19 +185,23 @@ int main(int argc, char** argv, char** envp)
 					return 0;
 				}
 			}
-			else if( std::string_view(argv[i]) == "-c" )
+			else if( Argument == "-c" )
 			{
 				Continuous = true;
 			}
-			else if( std::string_view(argv[i]) == "-l" )
+			else if( Argument == "-l" )
 			{
 				Logging = true;
 			}
-			else if( std::string_view(argv[i]) == "-d" )
+			else if( Argument == "-o" || Argument == "--optional" )
 			{
-				if( i != argc )
+				DumpOptional = true;
+			}
+			else if( Argument == "-d" || Argument == "--dump" )
+			{
+				if( i + 1 < argc )
 				{
-					TargetPath = argv[i + 1];
+					TargetPath = argv[++i];
 				}
 				else
 				{
@@ -319,9 +331,31 @@ int main(int argc, char** argv, char** envp)
 
 	// Get local app data folder
 	std::wofstream LogFile;
-	char* LocalAppData;
-	size_t len;
-	errno_t err = _dupenv_s(&LocalAppData, &len, "LOCALAPPDATA");
+	char* LocalAppData = nullptr;
+	size_t len = 0;
+	if( _dupenv_s(&LocalAppData, &len, "LOCALAPPDATA") != 0 )
+	{
+		LocalAppData = nullptr;
+	}
+
+	std::filesystem::path UserLocalAppData;
+	if( LocalAppData != nullptr )
+	{
+		UserLocalAppData = LocalAppData;
+		free(LocalAppData);
+	}
+
+	// The dumper thread runs inside the app's container, where LOCALAPPDATA is
+	// redirected. Compute the real path here and hand it over through the IPC
+	// shared section.
+	std::filesystem::path DumpFolderPath;
+	if( !UserLocalAppData.empty() )
+	{
+		DumpFolderPath = UserLocalAppData;
+		DumpFolderPath.append("Packages");
+		DumpFolderPath.append(PackageFileName);
+		DumpFolderPath.append("TempState\\DUMP");
+	}
 
 	if( !TargetPath.empty() )
 	{
@@ -335,22 +369,49 @@ int main(int argc, char** argv, char** envp)
 			return EXIT_FAILURE;
 		}
 
-		// Get dump folder path
-		std::filesystem::path DumpFolderPath(LocalAppData);
-		DumpFolderPath.append("Packages");
-		DumpFolderPath.append(PackageFileName);
-		DumpFolderPath.append("TempState\\DUMP");
+		if( DumpFolderPath.empty() )
+		{
+			std::cout << "\033[91mUnable to determine the package TempState folder\033[0m" << std::endl;
+			if( !Continuous ) system("pause");
+			return EXIT_FAILURE;
+		}
+
 		// Clear out dump folder
 		std::filesystem::remove_all(DumpFolderPath);
 		// Create junction
-		CreateJunction(DumpFolderPath.string().c_str(), TargetPath.string().c_str());
+		const DWORD JunctionError = CreateJunction(
+			DumpFolderPath.string().c_str(),
+			TargetPath.string().c_str()
+		);
+		if( JunctionError != ERROR_SUCCESS )
+		{
+			std::cout
+				<< "\033[93mUnable to redirect TempState\\DUMP to " << TargetPath
+				<< " (error " << JunctionError << "). The dump will stay in the package's TempState folder.\033[0m"
+				<< std::endl;
+		}
 		// Set ACL for target directory
-		SetAccessControl(TargetPath, L"S-1-15-2-1");
+		SetAccessControl(TargetPath.wstring(), L"S-1-15-2-1");
 	}
 
 	SetAccessControl(GetRunningDirectory() + L'\\' + DLLFile, L"S-1-15-2-1");
 
+	HANDLE TargetProcess = OpenProcess(
+		SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+		false,
+		ProcessID
+	);
+
 	IPC::SetTargetProcess(ProcessID);
+	IPC::SetDumpOptionalPackages(DumpOptional);
+	if( !DumpFolderPath.empty() )
+	{
+		IPC::SetDumpPath(DumpFolderPath.c_str());
+	}
+	if( DumpOptional )
+	{
+		std::cout << "\033[93mOptional packages (DLC) will be dumped too" << std::endl;
+	}
 
 	std::cout << "\033[93mInjecting into remote process: ";
 	if( !DLLInjectRemote(ProcessID, GetRunningDirectory() + L'\\' + DLLFile) )
@@ -411,8 +472,19 @@ int main(int argc, char** argv, char** envp)
 	std::cout << "\033[0m" << std::flush;
 	std::wstring CurMessage;
 	CurMessage.reserve(IPC::MessageEntry::StringSize);
+	bool TargetExited = false;
 	while( IPC::GetTargetThread() != IPC::InvalidThread )
 	{
+		if(
+			TargetProcess != nullptr &&
+			WaitForSingleObject(TargetProcess, 0) == WAIT_OBJECT_0
+		)
+		{
+			TargetExited = true;
+			std::cout << "\033[91m\nTarget process exited before the dump finished\033[0m" << std::endl;
+			break;
+		}
+
 		while( IPC::PopMessage(CurMessage) )
 		{
 			std::wcout << CurMessage << "\033[0m";
@@ -422,19 +494,23 @@ int main(int argc, char** argv, char** envp)
 			}
 		}
 	}
+	if( TargetProcess != nullptr )
+	{
+		CloseHandle(TargetProcess);
+	}
 	if( Logging ) LogFile.close();
 	if( !Continuous ) {
 		// Open Tempstate folder for user
-		std::filesystem::path DumpFolderPath(LocalAppData);
-		DumpFolderPath = DumpFolderPath / "Packages" / PackageFileName / "TempState";
-
-		ShellExecuteW(
-			nullptr, L"open", DumpFolderPath.c_str(), nullptr, nullptr,
-			SW_SHOWDEFAULT
-		);
+		if( !DumpFolderPath.empty() )
+		{
+			ShellExecuteW(
+				nullptr, L"open", DumpFolderPath.parent_path().c_str(), nullptr, nullptr,
+				SW_SHOWDEFAULT
+			);
+		}
 		system("pause");
 	}
-	return EXIT_SUCCESS;
+	return TargetExited ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 void SetAccessControl(const std::wstring& ExecutableName, const wchar_t* AccessString)
@@ -610,6 +686,12 @@ std::wstring GetRunningDirectory()
 {
 	wchar_t RunPath[MAX_PATH];
 	GetModuleFileNameW(GetModuleHandleW(nullptr), RunPath, MAX_PATH);
-	PathRemoveFileSpecW(RunPath);
-	return std::wstring(RunPath);
+
+	std::wstring Path(RunPath);
+	const std::size_t Separator = Path.find_last_of(L"\\/");
+	if( Separator != std::wstring::npos )
+	{
+		Path.resize(Separator);
+	}
+	return Path;
 }

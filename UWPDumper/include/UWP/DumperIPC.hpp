@@ -28,6 +28,17 @@ IPC_API std::uint32_t GetClientProcess();
 IPC_API void SetTargetProcess(std::uint32_t ProcessID);
 IPC_API std::uint32_t GetTargetProcess();
 
+// Whether the dumper should also dump the package's optional packages (DLC).
+IPC_API void SetDumpOptionalPackages(bool Enabled);
+IPC_API bool GetDumpOptionalPackages();
+
+// The dump folder as the injector computed it (the package's TempState\DUMP).
+// The injected process sees a redirected LOCALAPPDATA, so it cannot derive the
+// same path by itself.
+constexpr std::size_t DumpPathSize = 1024;
+IPC_API void SetDumpPath(const wchar_t* Path);
+IPC_API const wchar_t* GetDumpPath();
+
 constexpr std::int32_t InvalidThread = -1;
 
 IPC_API void SetTargetThread(std::int32_t ThreadID);
